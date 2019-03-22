@@ -37,10 +37,17 @@ public:
   }
 
   int
-  startScanConnect(BleClientImpl& client)
-  {
-    return __LINE__;
-  }
+  startScanConnect(BleClientImpl& client);
+
+private:
+  static void
+  scanCb(ble_gap_evt_adv_report_t* report);
+
+  static void
+  connectCb(uint16_t connHandle);
+
+private:
+  BleClientImpl* m_client = nullptr;
 };
 
 extern BleDeviceImplClass BleDeviceImpl;
@@ -110,27 +117,107 @@ private:
   BLECharacteristic m_tx;
 };
 
-class BleClientImpl
+class BleClientImpl : public BLEClientService
 {
 public:
-  bool
-  begin()
+  BleClientImpl()
+    : BLEClientService(BLE_UUID_SVC)
+    , m_rx(BLE_UUID_TX)
+    , m_tx(BLE_UUID_RX)
   {
-    return false;
+  }
+
+  bool
+  begin() override
+  {
+    this->BLEClientService::begin();
+    m_rx.begin(this);
+    m_tx.begin(this);
+    m_rx.setNotifyCallback(&BleClientImpl::rxNotify);
+    return true;
+  }
+
+  bool
+  discover(uint16_t connHandle) override
+  {
+    VERIFY(this->BLEClientService::discover(connHandle));
+    _conn_hdl = BLE_CONN_HANDLE_INVALID;
+    VERIFY(2 == Bluefruit.Discovery.discoverCharacteristic(connHandle, m_rx, m_tx));
+    VERIFY(m_rx.enableNotify());
+    _conn_hdl = connHandle;
+    return true;
   }
 
   size_t
   receive(uint8_t* buf, size_t bufSize)
   {
-    return 0;
+    uint16_t len = m_rxLen;
+    memcpy(buf, m_rxData, std::min<uint16_t>(bufSize, len));
+    m_rxLen = 0;
+    return len;
   }
 
   bool
   send(const uint8_t* pkt, size_t len)
   {
-    return false;
+    if (!this->discovered()) {
+      return false;
+    }
+    m_tx.write(pkt, len);
+    return true;
   }
+
+private:
+  static void
+  rxNotify(BLEClientCharacteristic* rx, uint8_t* data, uint16_t len)
+  {
+    BleClientImpl& client = static_cast<BleClientImpl&>(rx->parentService());
+    memcpy(client.m_rxData, data, len);
+    client.m_rxLen = len;
+  }
+
+private:
+  BLEClientCharacteristic m_rx;
+  BLEClientCharacteristic m_tx;
+  uint16_t m_rxLen = 0;
+  uint8_t m_rxData[BLE_GATT_ATT_MTU_MAX];
 };
+
+inline int
+BleDeviceImplClass::startScanConnect(BleClientImpl& client)
+{
+  if (m_client != nullptr) {
+    return __LINE__; // only support one client
+  }
+  m_client = &client;
+
+  Bluefruit.Central.setConnectCallback(&BleDeviceImplClass::connectCb);
+  Bluefruit.Scanner.setRxCallback(&BleDeviceImplClass::scanCb);
+
+  Bluefruit.Scanner.clearFilters();
+  Bluefruit.Scanner.restartOnDisconnect(true);
+  Bluefruit.Scanner.setInterval(160, 80);
+  Bluefruit.Scanner.filterService(client);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.start(0);
+  return 0;
+}
+
+inline void
+BleDeviceImplClass::scanCb(ble_gap_evt_adv_report_t* report)
+{
+  Bluefruit.Central.connect(report);
+}
+
+inline void
+BleDeviceImplClass::connectCb(uint16_t connHandle)
+{
+  BleClientImpl* client = BleDeviceImpl.m_client;
+  if (client != nullptr && client->discover(connHandle)) {
+    return;
+  }
+  Bluefruit.Central.disconnect(connHandle);
+}
 
 } // namespace ndn
 
